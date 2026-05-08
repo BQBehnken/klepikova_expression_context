@@ -1,0 +1,176 @@
+bash download_klepikova.sh [metadata | download | all]
+           │
+           ├── metadata ──► fetch_metadata()
+           │                    │
+           │                    ├─ esearch + efetch ──► runinfo_PRJNA314076.csv
+           │                    ├─ esearch + efetch ──► runinfo_PRJNA324514.csv
+           │                    │
+           │                    └─ merge + dedup ──────► klepikova_runinfo.csv ──► Also Step 5
+           │                                             (allows you to check metadat)
+           │
+           ├── download ──► download_fastqs()
+           │                    │
+           │                    ├─ grep tissue pattern ──► selected_srrs.txt
+           │                    │   (seed|root|stem|...)       (just SRR IDs)
+           │                    │
+           │                    └─ for each SRR:
+           │                          prefetch  (downloads .sra file)
+           │                          fasterq-dump (converts .sra → .fastq)
+           │                          gzip (.fastq → .fastq.gz)
+           │
+           └── all ──────► fetch_metadata() then download_fastqs()  -> data/klepikova/fastqs/ ... 
+
+bash qc_trim_klepikova.sh [threads] 
+
+           data/klepikova/fastqs/
+           SRR123.fastq.gz
+           SRR456.fastq.gz
+           ...
+           │
+           ▼
+     ┌──────────────────────────────────────────────────┐
+     │  for each .fastq.gz                              │
+     │                                                  │
+     │  1. FastQC (pre-trim)                            │
+     │        └──► fastqc_pretrim/                      │
+     │                                                  │
+     │  2. Trimmomatic SE                               │
+     │        ├── ILLUMINACLIP  (adapters)              │
+     │        ├── LEADING:3     (5' end)                │
+     │        ├── TRAILING:3    (3' end)                │
+     │        ├── SLIDINGWINDOW:4:15 (middle)           │
+     │        └── MINLEN:36     (short reads)           │
+     │              └──► trimmed/SRR123_trimmed.fastq.gz│
+     │                                                  │
+     │  3. FastQC (post-trim)                           │
+     │        └──► fastqc_posttrim/                     │
+     └──────────────────────────────────────────────────┘
+           │
+           ▼
+
+  bash align_klepikova.sh [index | align | all] [threads]
+                │
+                ├── index ──► build_index()
+                │                 │
+                │                 ├─ curl ──► TAIR10_genome.fa.gz ──► gunzip ──► TAIR10_genome.fa
+                │                 ├─ curl ──► TAIR10.gtf.gz        ──► gunzip ──► TAIR10.gtf
+                │                 └─ bowtie2-build ──────────────────────────► bowtie2_index/TAIR10.*
+                │                                                             (We used 6 index files)
+                ├── align ──► align_reads()
+                │                 │
+                │                 │  for each *_trimmed.fastq.gz:
+                │                 │
+                │                 ├─ [BAM exists?] ──YES──► skip
+                │                 │        │
+                │                 │        NO
+                │                 │        ▼
+                │                 │   tophat2 -p -i 50 -I 5000 -G TAIR10.gtf
+                │                 │        │
+                │                 │        └──► bam/SRR123/
+                │                 │                 accepted_hits.bam   ← mapped reads
+                │                 │                 unmapped.bam
+                │                 │                 junctions.bed
+                │                 │                 insertions.bed
+                │                 │                 deletions.bed
+                │                 │
+                └── all ──► build_index() then align_reads() ... ──► SRR123/accepted_hits.bam
+
+           │
+           ▼
+
+bash quantify_klepikova.sh [threads]
+
+data/klepikova/bam/
+     SRR123/accepted_hits.bam  ──┐
+     SRR456/accepted_hits.bam  ──┤
+     SRR789/accepted_hits.bam  ──┤──► featureCounts ──► featurecounts_raw.txt
+     ...                       ──┘         ▲
+                                           │
+                                 TAIR10.gtf (tells featureCounts
+                                            where genes/exons are)
+  featurecounts_raw.txt layout:
+  ┌──────────┬────────┬─────┬──────┬────────────────────────────────┐
+  │ Geneid   │ Chr    │ ... │Length│ bam/SRR123/... bam/SRR456/...  │
+  ├──────────┼────────┼─────┼──────┼────────────────────────────────┤
+  │AT1G01010 │ 1      │ ... │ 1688 │     243            891         │
+  │AT1G01020 │ 1      │ ... │ 1044 │      57            102         │
+  │ ...      │        │     │      │                                │
+  └──────────┴────────┴─────┴──────┴────────────────────────────────┘ 
+
+    featurecounts_raw.txt.summary:
+    Assigned              ← reads that landed cleanly in one gene
+    Unassigned_Ambiguous  ← reads spanning two genes
+    Unassigned_NoFeatures ← reads in intergenic regions
+    Unassigned_MultiMapping ← reads that aligned to >1 place
+
+           │
+           ▼
+
+Rscript aggregate_klepikova.R
+
+featurecounts_raw.txt          klepikova_runinfo.csv
+    # comment lines               Run, SampleName, ...
+    Geneid  Chr ... SRR123  SRR456  SRR789 ...
+    AT1G... 1   ...  243     891     57                     join on SRR
+          │                                                     │
+          ▼                                                     ▼
+    Step 1: parse counts                          Step 2: tissue mapping
+    strip path from col names                     grepl("leaf|root|...") on SampleName
+    rows = genes, cols = SRRs                     SRR123 → "leaf"
+          │                                       SRR456 → "leaf"
+          └──────────────────┬────────────────────┘
+                             ▼
+                    Step 3: DESeq2 normalization
+                    estimateSizeFactors()
+                    norm_count = raw / size_factor
+                             │
+                             ▼
+                    Step 4: average replicates
+                    leaf_mean = rowMeans(SRR123, SRR456)
+                             │
+                             ▼
+                    Step 5: log2(x + 1)
+                             │
+                             ▼
+                    Step 6: clean gene IDs
+                    AT1G01010.1 → AT1G01010
+                             │
+                             ▼
+                    Step 7: export TSV
+      taxa       Seed   Root   Stem   Petal  Carpel  Leaf
+      AT1G01010  3.21   1.05   2.87   0.00   4.12    6.33
+      AT1G01020  ...
+
+           │
+           ▼
+
+python3 scripts/format_klepikova_bat.py
+
+
+data/klepikova/klepikova_expression_matrix.tsv
+    taxa       Seed   Root   Leaf  ...
+    AT1G01010  3.21   1.05   6.33
+    AT1G01020  0.0    2.17   0.0
+    scaffold_x 0.22   0.11   0.33   ← fails regex → SKIP (Also ATCG/ATMG gets filtered out)
+            │
+            ▼  for each row:
+            │
+            ├─ re.sub isoform suffix  (AT1G01010.1 → AT1G01010)
+            │
+            ├─ TAIR10_PATTERN.match?
+            │     NO  → skip row entirely
+            │     YES → continue
+            │
+            ├─ for each value:
+            │     0.0  → "NA"
+            │     else → keep as string
+            │
+            └─ deduplicate gene IDs (The ID that is seen first wins)
+            │
+            ▼
+  datasets/klepikova_tair10_expression.txt
+    taxa       Seed   Root   Leaf  ...
+    AT1G01010  3.21   1.05   6.33
+    AT1G01020  NA     2.17   NA     ← zeros replaced
+
+Load your own expression dataset into /datasets and the BAT R script should pick it up and populate your defaul outputs. 
