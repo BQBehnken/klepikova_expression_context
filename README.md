@@ -8,4 +8,3 @@ The order of events are:
   4. quantify_klepikova.sh — count reads per gene from BAMs with featureCounts; creates count matrix to prepare for working in the BAT context
   5. aggregate_klepikova.R — DESeq2 normalization, average replicates per tissue, log2-transform for tissue-to-tissue expression matrix
   6. format_klepikova_bat.py — reformat expression matrix into BAT dataset format and places in folder datasets/
-  7. validate_klepikova.py — Verify the final values against eFP browser RPKM data
